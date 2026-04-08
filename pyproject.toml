@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autoevolve"
+version = "0.1.0"
+description = "Recursive multi-agent build system that iterates until a task is done."
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.27",
+    "typer>=0.12",
+    "rich>=13.7",
+    "textual>=0.60",
+    "python-telegram-bot>=21.0",
+    "pydantic>=2.6",
+    "python-dotenv>=1.0",
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+]
+
+[project.scripts]
+autoevolve = "autoevolve.cli:app"
+
+[tool.setuptools.packages.find]
+include = ["autoevolve*"]

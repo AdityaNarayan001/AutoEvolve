@@ -1,1 +1,19 @@
 .venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Local config & secrets
+.env
+.env.*
+
+# Runtime state (task workspaces, logs, checkpoints)
+runs/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
