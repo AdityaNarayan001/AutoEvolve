@@ -38,6 +38,10 @@ class Settings:
     litellm_model: str = _env("AUTOEVOLVE_MODEL", "kimi-latest")
     litellm_max_tokens: int = int(_env("AUTOEVOLVE_MAX_TOKENS", "4096"))
 
+    # Ollama (local models)
+    ollama_url: str = _env("AUTOEVOLVE_OLLAMA_URL", "http://localhost:11434")
+    ollama_model: str = _env("AUTOEVOLVE_OLLAMA_MODEL", "")
+
     # Claude CLI binary
     claude_cli_bin: str = _env("AUTOEVOLVE_CLAUDE_BIN", "claude")
     claude_cli_model: str = _env("AUTOEVOLVE_CLAUDE_MODEL", "")

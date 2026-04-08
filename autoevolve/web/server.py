@@ -35,6 +35,8 @@ EDITABLE_KEYS = [
     "JUSPAY_API_KEY",
     "AUTOEVOLVE_LITELLM_URL",
     "AUTOEVOLVE_MODEL",
+    "AUTOEVOLVE_OLLAMA_URL",
+    "AUTOEVOLVE_OLLAMA_MODEL",
     "AUTOEVOLVE_CLAUDE_BIN",
     "AUTOEVOLVE_CLAUDE_MODEL",
     "AUTOEVOLVE_SANDBOX",
@@ -95,6 +97,8 @@ def _apply_settings_in_place() -> None:
     )
     SETTINGS.litellm_api_key = os.environ.get("JUSPAY_API_KEY", "")
     SETTINGS.litellm_model = os.environ.get("AUTOEVOLVE_MODEL") or "kimi-latest"
+    SETTINGS.ollama_url = os.environ.get("AUTOEVOLVE_OLLAMA_URL") or "http://localhost:11434"
+    SETTINGS.ollama_model = os.environ.get("AUTOEVOLVE_OLLAMA_MODEL", "")
     SETTINGS.claude_cli_bin = os.environ.get("AUTOEVOLVE_CLAUDE_BIN") or "claude"
     SETTINGS.sandbox_mode = os.environ.get("AUTOEVOLVE_SANDBOX") or "auto"
     SETTINGS.telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -107,6 +111,14 @@ def _apply_settings_in_place() -> None:
 @app.get("/api/config")
 async def get_config():
     return _read_env()
+
+
+@app.get("/api/ollama/models")
+async def ollama_models(url: str | None = None):
+    from ..llm.ollama import list_local_models
+
+    models = list_local_models(url or os.environ.get("AUTOEVOLVE_OLLAMA_URL"))
+    return {"models": models, "ok": bool(models)}
 
 
 @app.post("/api/config")
@@ -268,7 +280,23 @@ label{display:block;font-size:11px;color:#888;margin-bottom:4px;text-transform:u
     <select id="cfg_backend" onchange="applyBackend()">
       <option value="claude_cli">claude_cli — use local Claude Code subscription</option>
       <option value="litellm_http">litellm_http — Anthropic-compatible HTTP (Juspay)</option>
+      <option value="ollama">ollama — local models on this machine</option>
     </select>
+  </div>
+
+  <div id="grp_ollama">
+    <div class="row">
+      <div class="field">
+        <label>Ollama URL</label>
+        <input id="cfg_ollama_url" placeholder="http://localhost:11434">
+      </div>
+      <div class="field">
+        <label>Model <span id="ollama_status" class="muted" style="text-transform:none;letter-spacing:0"></span></label>
+        <select id="cfg_ollama_model"><option value="">(none)</option></select>
+      </div>
+    </div>
+    <div class="hint">Models are read from your running Ollama daemon. Install with <code>ollama pull llama3</code>, then click refresh.</div>
+    <button class="secondary" type="button" onclick="loadOllamaModels()">Refresh models</button>
   </div>
 
   <div id="grp_litellm">
@@ -362,6 +390,8 @@ async function loadConfig() {
   $('cfg_api_key').value = c.JUSPAY_API_KEY || '';
   $('cfg_url').value = c.AUTOEVOLVE_LITELLM_URL || '';
   $('cfg_claude_bin').value = c.AUTOEVOLVE_CLAUDE_BIN || '';
+  $('cfg_ollama_url').value = c.AUTOEVOLVE_OLLAMA_URL || 'http://localhost:11434';
+  await loadOllamaModels(c.AUTOEVOLVE_OLLAMA_MODEL || '');
   $('cfg_sandbox').value = c.AUTOEVOLVE_SANDBOX || 'auto';
   $('cfg_tg_token').value = c.TELEGRAM_BOT_TOKEN || '';
   $('cfg_tg_chat').value = c.TELEGRAM_CHAT_ID || '';
@@ -373,20 +403,51 @@ function applyBackend() {
   const b = $('cfg_backend').value;
   const litellmFields = ['cfg_api_key','cfg_model','cfg_url'];
   const claudeFields = ['cfg_claude_bin'];
+  const ollamaFields = ['cfg_ollama_url','cfg_ollama_model'];
   litellmFields.forEach(id => $(id).closest('.field').classList.toggle('disabled', b !== 'litellm_http'));
   claudeFields.forEach(id => $(id).closest('.field').classList.toggle('disabled', b !== 'claude_cli'));
-  // group hint visibility
+  ollamaFields.forEach(id => $(id).closest('.field').classList.toggle('disabled', b !== 'ollama'));
   $('grp_litellm').style.opacity = b === 'litellm_http' ? '1' : '.5';
   $('grp_claude').style.opacity = b === 'claude_cli' ? '1' : '.5';
+  $('grp_ollama').style.opacity = b === 'ollama' ? '1' : '.5';
+  refreshBadges();
+}
+
+async function loadOllamaModels(preferred) {
+  const url = $('cfg_ollama_url').value || '';
+  const status = $('ollama_status');
+  status.textContent = '… loading';
+  try {
+    const r = await (await fetch('/api/ollama/models?url=' + encodeURIComponent(url))).json();
+    const sel = $('cfg_ollama_model');
+    const want = preferred || sel.value;
+    sel.innerHTML = '';
+    if (!r.models || !r.models.length) {
+      sel.innerHTML = '<option value="">(no models — is ollama running?)</option>';
+      status.textContent = 'daemon unreachable or empty';
+    } else {
+      for (const m of r.models) {
+        const o = document.createElement('option');
+        o.value = m; o.textContent = m;
+        sel.appendChild(o);
+      }
+      if (want && r.models.includes(want)) sel.value = want;
+      status.textContent = r.models.length + ' available';
+    }
+  } catch (e) {
+    status.textContent = 'error';
+  }
   refreshBadges();
 }
 
 function refreshBadges() {
   const b = $('cfg_backend').value;
-  const ok = b === 'litellm_http' ? !!$('cfg_api_key').value.trim() : true;
+  let ok = true, label = 'claude cli';
+  if (b === 'litellm_http') { ok = !!$('cfg_api_key').value.trim(); label = ok ? 'litellm ready' : 'api key needed'; }
+  else if (b === 'ollama') { ok = !!$('cfg_ollama_model').value; label = ok ? 'ollama: ' + $('cfg_ollama_model').value : 'pick a model'; }
   const badge = $('cfg_status');
   badge.className = 'badge ' + (ok ? 'ok' : 'warn');
-  badge.textContent = ok ? (b === 'litellm_http' ? 'litellm ready' : 'claude cli') : 'api key needed';
+  badge.textContent = label;
 
   const tg = $('cfg_tg_token').value.trim() && $('cfg_tg_chat').value.trim();
   const tb = $('tg_badge');
@@ -394,7 +455,7 @@ function refreshBadges() {
   tb.textContent = tg ? 'enabled' : 'off';
 }
 
-['cfg_api_key','cfg_tg_token','cfg_tg_chat','cfg_model','cfg_url','cfg_claude_bin'].forEach(id => {
+['cfg_api_key','cfg_tg_token','cfg_tg_chat','cfg_model','cfg_url','cfg_claude_bin','cfg_ollama_model'].forEach(id => {
   const el = document.getElementById(id);
   if (el) el.addEventListener('input', refreshBadges);
 });
@@ -406,6 +467,8 @@ function configPayload() {
     JUSPAY_API_KEY: $('cfg_api_key').value,
     AUTOEVOLVE_LITELLM_URL: $('cfg_url').value,
     AUTOEVOLVE_CLAUDE_BIN: $('cfg_claude_bin').value,
+    AUTOEVOLVE_OLLAMA_URL: $('cfg_ollama_url').value,
+    AUTOEVOLVE_OLLAMA_MODEL: $('cfg_ollama_model').value,
     AUTOEVOLVE_SANDBOX: $('cfg_sandbox').value,
     TELEGRAM_BOT_TOKEN: $('cfg_tg_token').value,
     TELEGRAM_CHAT_ID: $('cfg_tg_chat').value,

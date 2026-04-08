@@ -58,4 +58,8 @@ def get_backend(name: str | None = None) -> Backend:
         from .litellm_http import LiteLLMHTTPBackend
 
         return LiteLLMHTTPBackend()
+    if n in ("ollama", "local"):
+        from .ollama import OllamaBackend
+
+        return OllamaBackend()
     raise ValueError(f"unknown backend: {name!r}")
