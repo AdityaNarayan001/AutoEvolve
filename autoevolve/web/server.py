@@ -296,7 +296,7 @@ label{display:block;font-size:11px;color:#888;margin-bottom:4px;text-transform:u
       </div>
     </div>
     <div class="hint">Models are read from your running Ollama daemon. Install with <code>ollama pull llama3</code>, then click refresh.</div>
-    <button class="secondary" type="button" onclick="loadOllamaModels()">Refresh models</button>
+    <button class="secondary" type="button" onclick="loadOllamaModels()" style="margin-bottom:16px">Refresh models</button>
   </div>
 
   <div id="grp_litellm">
