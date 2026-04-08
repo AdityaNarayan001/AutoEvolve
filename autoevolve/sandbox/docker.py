@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shlex
 import uuid
 from pathlib import Path
@@ -46,7 +47,10 @@ class DockerSandbox(Sandbox):
             "--network", "none",
             "--cpus", SETTINGS.sandbox_cpu,
             "--memory", SETTINGS.sandbox_mem,
-            "--user", "1000:1000",
+            # Use the host user's uid/gid so files in the bind-mounted workspace
+            # are readable/writable from both sides. Falls back to root in the
+            # container if uid lookup fails (e.g. on non-POSIX hosts).
+            "--user", f"{os.getuid()}:{os.getgid()}" if hasattr(os, "getuid") else "0:0",
             "-v", f"{self.workspace}:/workspace",
             "-w", "/workspace",
             self.image,

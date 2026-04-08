@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shlex
+import shutil
 
 from ..config import SETTINGS
 from .base import Backend, Message, Response, ToolSpec
@@ -16,8 +17,19 @@ class ClaudeCLIBackend(Backend):
     name = "claude_cli"
 
     def __init__(self, binary: str | None = None, model: str | None = None):
-        self.binary = binary or SETTINGS.claude_cli_bin
+        self.binary = (binary or SETTINGS.claude_cli_bin or "claude").strip()
         self.model = model or SETTINGS.claude_cli_model
+        if not self.binary:
+            raise RuntimeError("claude_cli backend: binary path is empty")
+        resolved = shutil.which(self.binary)
+        if not resolved:
+            raise RuntimeError(
+                f"claude_cli backend: '{self.binary}' not found on PATH. "
+                "Install Claude Code (`npm i -g @anthropic-ai/claude-code` or similar) "
+                "or set AUTOEVOLVE_CLAUDE_BIN to the full path, "
+                "or switch backend to 'litellm_http'."
+            )
+        self.binary = resolved
 
     async def complete(
         self,

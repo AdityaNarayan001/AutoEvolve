@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from ..llm.base import Backend, Message
 from ..sandbox import Sandbox
@@ -38,12 +38,16 @@ class Agent:
         tools: ToolRegistry,
         sandbox: Sandbox,
         max_steps: int = 30,
+        should_continue: Callable[[], bool] | None = None,
+        get_nudge: Callable[[], str] | None = None,
     ):
         self.role = role
         self.backend = backend
         self.tools = tools
         self.sandbox = sandbox
         self.max_steps = max_steps
+        self.should_continue = should_continue
+        self.get_nudge = get_nudge
 
     async def run(self, user_prompt: str) -> AgentResult:
         sys_prompt = self.role.system_prompt + "\n\n" + TOOL_PROTOCOL
@@ -58,6 +62,13 @@ class Agent:
         result = AgentResult(final_text="", transcript=messages)
 
         for _ in range(self.max_steps):
+            if self.should_continue and not self.should_continue():
+                result.final_text = "(stopped by orchestrator)"
+                return result
+            if self.get_nudge:
+                nudge = self.get_nudge()
+                if nudge:
+                    messages.append(Message("user", f"USER NUDGE: {nudge}"))
             resp = await self.backend.complete(system=sys_prompt, messages=messages)
             result.tokens_in += resp.input_tokens
             result.tokens_out += resp.output_tokens

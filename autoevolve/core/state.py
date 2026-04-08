@@ -67,6 +67,7 @@ class TaskState:
     finished_at: float = 0.0
     iterations: list[Iteration] = field(default_factory=list)
     role_specs: list[dict] = field(default_factory=list)
+    master_plan: dict = field(default_factory=dict)  # produced once in plan mode
     tokens_in: int = 0
     tokens_out: int = 0
     last_error: str = ""
@@ -163,6 +164,7 @@ def _from_jsonable(data: dict) -> TaskState:
         finished_at=data.get("finished_at", 0.0),
         iterations=iters,
         role_specs=data.get("role_specs", []),
+        master_plan=data.get("master_plan", {}) or {},
         tokens_in=data.get("tokens_in", 0),
         tokens_out=data.get("tokens_out", 0),
         last_error=data.get("last_error", ""),

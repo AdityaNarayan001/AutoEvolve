@@ -74,9 +74,31 @@ def _write_env(updates: dict[str, str]) -> None:
     for k, v in updates.items():
         if k not in EDITABLE_KEYS:
             continue
+        v = (v or "").strip()
+        if not v:
+            # Empty field = leave existing value alone, do not clobber defaults.
+            continue
         existing[k] = v
         os.environ[k] = v  # apply to current process so daemons inherit
     ENV_PATH.write_text("\n".join(f"{k}={v}" for k, v in existing.items()) + "\n")
+    _apply_settings_in_place()
+
+
+def _apply_settings_in_place() -> None:
+    """Mutate SETTINGS in place so already-imported modules see the new values.
+    Re-importing config would create a new SETTINGS instance and leave every
+    `from ..config import SETTINGS` reference dangling at the old object."""
+    SETTINGS.backend = os.environ.get("AUTOEVOLVE_BACKEND") or "claude_cli"
+    SETTINGS.litellm_url = (
+        os.environ.get("AUTOEVOLVE_LITELLM_URL")
+        or "https://grid.ai.juspay.net/v1/messages"
+    )
+    SETTINGS.litellm_api_key = os.environ.get("JUSPAY_API_KEY", "")
+    SETTINGS.litellm_model = os.environ.get("AUTOEVOLVE_MODEL") or "kimi-latest"
+    SETTINGS.claude_cli_bin = os.environ.get("AUTOEVOLVE_CLAUDE_BIN") or "claude"
+    SETTINGS.sandbox_mode = os.environ.get("AUTOEVOLVE_SANDBOX") or "auto"
+    SETTINGS.telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    SETTINGS.telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 
 # ---------- API ----------
@@ -131,6 +153,7 @@ async def run_detail(task_id: str):
             for it in s.iterations
         ],
         "roles": [r.get("title", "?") for r in s.role_specs],
+        "master_plan": s.master_plan,
         "tokens_in": s.tokens_in,
         "tokens_out": s.tokens_out,
     }
@@ -144,11 +167,7 @@ async def create_run(payload: dict[str, Any]):
     # Persist config first if the form sent it
     cfg = payload.get("config") or {}
     if cfg:
-        _write_env(cfg)
-        # Reload SETTINGS so the spawned daemon sees fresh values
-        from importlib import reload
-        from .. import config as _cfg
-        reload(_cfg)
+        _write_env(cfg)  # also mutates SETTINGS in place
 
     done = DoneConfig(
         llm_judge=bool(payload.get("judge", True)),
@@ -208,8 +227,17 @@ body{background:#0c0d10;color:#e6e6e6;font-family:-apple-system,system-ui,sans-s
 h1{margin:0 0 16px;font-weight:600}
 h2{font-size:14px;text-transform:uppercase;letter-spacing:1px;color:#888;margin-top:24px}
 .card{background:#15171c;border:1px solid #23252c;border-radius:10px;padding:16px;margin-bottom:16px}
-input,select,textarea,button{background:#0c0d10;color:#e6e6e6;border:1px solid #2a2d36;border-radius:6px;padding:8px 10px;font-size:13px;font-family:inherit}
+input,select,textarea,button{background:#0c0d10;color:#e6e6e6;border:1px solid #2a2d36;border-radius:6px;padding:8px 10px;font-size:13px;font-family:inherit;transition:opacity .15s,border-color .15s}
 input,select,textarea{width:100%;box-sizing:border-box;margin-bottom:8px}
+input:focus,select:focus,textarea:focus{outline:none;border-color:#2563eb}
+.field{margin-bottom:8px}
+.field.disabled label{color:#444}
+.field.disabled input,.field.disabled select{opacity:.35;pointer-events:none;background:#0a0b0e}
+.badge{display:inline-block;font-size:10px;padding:2px 6px;border-radius:4px;background:#2563eb;color:#fff;margin-left:6px;vertical-align:middle;text-transform:uppercase;letter-spacing:.5px}
+.badge.warn{background:#f59e0b}
+.badge.ok{background:#10b981}
+.badge.muted{background:#2a2d36;color:#888}
+.hint{font-size:11px;color:#666;margin-top:-4px;margin-bottom:8px}
 textarea{min-height:80px;resize:vertical;font-family:ui-monospace,Menlo,monospace}
 button{cursor:pointer;background:#2563eb;border-color:#2563eb;color:#fff;font-weight:600}
 button:hover{background:#1d4ed8}
@@ -234,54 +262,63 @@ label{display:block;font-size:11px;color:#888;margin-bottom:4px;text-transform:u
 <h1>AutoEvolve</h1>
 
 <div class="card">
-  <h2 style="margin-top:0">Config</h2>
-  <div class="row">
-    <div>
-      <label>Backend</label>
-      <select id="cfg_backend">
-        <option value="claude_cli">claude_cli (use local Claude subscription)</option>
-        <option value="litellm_http">litellm_http (Juspay endpoint)</option>
-      </select>
-    </div>
-    <div>
-      <label>Model (for litellm_http)</label>
-      <input id="cfg_model" placeholder="kimi-latest">
-    </div>
+  <h2 style="margin-top:0">Config <span id="cfg_status" class="badge muted">unknown</span></h2>
+  <div class="field">
+    <label>Backend</label>
+    <select id="cfg_backend" onchange="applyBackend()">
+      <option value="claude_cli">claude_cli — use local Claude Code subscription</option>
+      <option value="litellm_http">litellm_http — Anthropic-compatible HTTP (Juspay)</option>
+    </select>
   </div>
-  <div class="row">
-    <div>
-      <label>Juspay API key</label>
-      <input id="cfg_api_key" type="password" placeholder="api-key">
+
+  <div id="grp_litellm">
+    <div class="row">
+      <div class="field">
+        <label>Juspay API key</label>
+        <input id="cfg_api_key" type="password" placeholder="api-key">
+      </div>
+      <div class="field">
+        <label>Model</label>
+        <input id="cfg_model" placeholder="kimi-latest">
+      </div>
     </div>
-    <div>
+    <div class="field">
       <label>LiteLLM URL</label>
       <input id="cfg_url" placeholder="https://grid.ai.juspay.net/v1/messages">
     </div>
   </div>
-  <div class="row">
-    <div>
+
+  <div id="grp_claude">
+    <div class="field">
       <label>Claude CLI binary</label>
       <input id="cfg_claude_bin" placeholder="claude">
-    </div>
-    <div>
-      <label>Sandbox</label>
-      <select id="cfg_sandbox">
-        <option value="auto">auto</option>
-        <option value="docker">docker</option>
-        <option value="local">local</option>
-      </select>
+      <div class="hint">Leave blank to use the <code>claude</code> command on your PATH.</div>
     </div>
   </div>
+
+  <div class="field">
+    <label>Sandbox</label>
+    <select id="cfg_sandbox">
+      <option value="auto">auto (orbstack → docker → local)</option>
+      <option value="orbstack">orbstack (macOS, fast & lightweight)</option>
+      <option value="docker">docker (Docker Desktop / engine)</option>
+      <option value="local">local (workspace-confined, no container)</option>
+    </select>
+  </div>
+
+  <h2>Telegram <span id="tg_badge" class="badge muted">off</span></h2>
   <div class="row">
-    <div>
-      <label>Telegram bot token</label>
+    <div class="field">
+      <label>Bot token</label>
       <input id="cfg_tg_token" type="password" placeholder="123:abc">
     </div>
-    <div>
-      <label>Telegram chat id</label>
+    <div class="field">
+      <label>Chat id</label>
       <input id="cfg_tg_chat" placeholder="123456">
     </div>
   </div>
+  <div class="hint">Both fields required to enable the Telegram bridge. Get your chat id by messaging the bot then opening <code>https://api.telegram.org/bot&lt;TOKEN&gt;/getUpdates</code>.</div>
+
   <button onclick="saveConfig()">Save config</button>
   <span id="cfg_msg" class="muted" style="margin-left:10px"></span>
 </div>
@@ -320,7 +357,7 @@ let focus = null, es = null;
 
 async function loadConfig() {
   const c = await (await fetch('/api/config')).json();
-  $('cfg_backend').value = c.AUTOEVOLVE_BACKEND || 'claude_cli';
+  $('cfg_backend').value = c.AUTOEVOLVE_BACKEND || (c.JUSPAY_API_KEY ? 'litellm_http' : 'claude_cli');
   $('cfg_model').value = c.AUTOEVOLVE_MODEL || '';
   $('cfg_api_key').value = c.JUSPAY_API_KEY || '';
   $('cfg_url').value = c.AUTOEVOLVE_LITELLM_URL || '';
@@ -328,7 +365,39 @@ async function loadConfig() {
   $('cfg_sandbox').value = c.AUTOEVOLVE_SANDBOX || 'auto';
   $('cfg_tg_token').value = c.TELEGRAM_BOT_TOKEN || '';
   $('cfg_tg_chat').value = c.TELEGRAM_CHAT_ID || '';
+  applyBackend();
+  refreshBadges();
 }
+
+function applyBackend() {
+  const b = $('cfg_backend').value;
+  const litellmFields = ['cfg_api_key','cfg_model','cfg_url'];
+  const claudeFields = ['cfg_claude_bin'];
+  litellmFields.forEach(id => $(id).closest('.field').classList.toggle('disabled', b !== 'litellm_http'));
+  claudeFields.forEach(id => $(id).closest('.field').classList.toggle('disabled', b !== 'claude_cli'));
+  // group hint visibility
+  $('grp_litellm').style.opacity = b === 'litellm_http' ? '1' : '.5';
+  $('grp_claude').style.opacity = b === 'claude_cli' ? '1' : '.5';
+  refreshBadges();
+}
+
+function refreshBadges() {
+  const b = $('cfg_backend').value;
+  const ok = b === 'litellm_http' ? !!$('cfg_api_key').value.trim() : true;
+  const badge = $('cfg_status');
+  badge.className = 'badge ' + (ok ? 'ok' : 'warn');
+  badge.textContent = ok ? (b === 'litellm_http' ? 'litellm ready' : 'claude cli') : 'api key needed';
+
+  const tg = $('cfg_tg_token').value.trim() && $('cfg_tg_chat').value.trim();
+  const tb = $('tg_badge');
+  tb.className = 'badge ' + (tg ? 'ok' : 'muted');
+  tb.textContent = tg ? 'enabled' : 'off';
+}
+
+['cfg_api_key','cfg_tg_token','cfg_tg_chat','cfg_model','cfg_url','cfg_claude_bin'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('input', refreshBadges);
+});
 
 function configPayload() {
   return {

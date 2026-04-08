@@ -20,9 +20,18 @@ class LiteLLMHTTPBackend(Backend):
         api_key: str | None = None,
         model: str | None = None,
     ):
-        self.url = url or SETTINGS.litellm_url
-        self.api_key = api_key or SETTINGS.litellm_api_key
-        self.model = model or SETTINGS.litellm_model
+        self.url = (url or SETTINGS.litellm_url or "").strip()
+        self.api_key = (api_key or SETTINGS.litellm_api_key or "").strip()
+        self.model = (model or SETTINGS.litellm_model or "").strip()
+        if not self.url:
+            raise RuntimeError("litellm_http backend: AUTOEVOLVE_LITELLM_URL is empty")
+        if not self.api_key:
+            raise RuntimeError(
+                "litellm_http backend: JUSPAY_API_KEY is empty. "
+                "Set it in the web Config card or .env."
+            )
+        if not self.model:
+            raise RuntimeError("litellm_http backend: AUTOEVOLVE_MODEL is empty")
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(600.0))
 
     async def complete(
@@ -59,22 +68,31 @@ class LiteLLMHTTPBackend(Backend):
             "anthropic-version": "2023-06-01",
         }
 
-        # Indefinite retry on transient errors (no token cap, no abort).
+        # Retry only on transient errors (network / timeout / 429 / 5xx).
+        # 4xx auth/validation errors are permanent and raise immediately.
         backoff = 2.0
-        for attempt in range(100):
+        for attempt in range(200):
             try:
                 r = await self._client.post(self.url, json=payload, headers=headers)
-                if r.status_code == 429 or r.status_code >= 500:
-                    raise httpx.HTTPStatusError(
-                        f"{r.status_code}", request=r.request, response=r
-                    )
-                r.raise_for_status()
-                data = r.json()
-                return self._parse(data)
-            except (httpx.HTTPError, httpx.TimeoutException):
+            except (httpx.TimeoutException, httpx.NetworkError):
                 await asyncio.sleep(min(backoff, 60))
                 backoff *= 1.5
-        raise RuntimeError("LiteLLM HTTP backend exhausted retries")
+                continue
+
+            if r.status_code == 429 or r.status_code >= 500:
+                await asyncio.sleep(min(backoff, 60))
+                backoff *= 1.5
+                continue
+
+            if r.status_code >= 400:
+                # Permanent: bad key, bad payload, model not found, etc.
+                raise RuntimeError(
+                    f"litellm_http {r.status_code}: {r.text[:500]}"
+                )
+
+            return self._parse(r.json())
+
+        raise RuntimeError("litellm_http: exhausted retries on transient errors")
 
     def _parse(self, data: dict[str, Any]) -> Response:
         text_parts: list[str] = []

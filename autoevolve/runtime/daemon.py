@@ -27,6 +27,11 @@ def is_running(task_id: str) -> bool:
         os.kill(pid, 0)
         return True
     except Exception:
+        # Stale pidfile (process died without cleanup, e.g. SIGKILL).
+        try:
+            pf.unlink()
+        except Exception:
+            pass
         return False
 
 
@@ -74,6 +79,18 @@ def spawn(task_id: str) -> int:
     _pidfile(task_id).write_text(str(os.getpid()))
     try:
         asyncio.run(_run_daemon(task_id))
+    except Exception:
+        import traceback as _tb
+        print("daemon crashed:", _tb.format_exc(), flush=True)
+        try:
+            from ..core.state import TaskState as _TS
+            st = _TS.load(task_id)
+            st.status = "error"
+            st.last_error = _tb.format_exc()
+            st.append_event("error", message="daemon crashed", traceback=_tb.format_exc())
+            st.save()
+        except Exception:
+            pass
     finally:
         try:
             _pidfile(task_id).unlink()
@@ -83,6 +100,18 @@ def spawn(task_id: str) -> int:
 
 
 async def _run_daemon(task_id: str) -> None:
+    # Re-read .env in the forked daemon and rebuild Settings so any config
+    # changes the user just made via the web UI are picked up.
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(override=True)
+    except Exception:
+        pass
+    from importlib import reload
+    from .. import config as _cfg
+    reload(_cfg)
+    from ..config import SETTINGS as _S  # noqa: F401
+
     state = TaskState.load(task_id)
     backend = get_backend(state.task.backend or None)
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import traceback
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
@@ -25,23 +26,50 @@ from ..llm.base import Backend, Message
 from ..sandbox import make_sandbox, Sandbox
 from ..tools import build_default_registry
 from .agent import Agent
+from .architect import build_architect_role, make_architect_tools
 from .judge import Judge
 from .role_forge import RoleForge, RoleSpec, _extract_json
 from .state import Iteration, TaskState
 
 
-MANAGER_SYSTEM = """You are the Manager of a recursive build system.
-Given the task, prior history, and the latest critique (if any), produce the
-next iteration plan as STRICT JSON:
+PLANNER_SYSTEM = """You are a Strategic Planner. Given a high-level task, produce
+a complete master plan BEFORE any execution begins. Think hard about phases,
+risks, success criteria, and the right experts to involve.
+
+Output STRICT JSON:
+{
+  "summary": string,                      // 1-2 sentence restatement of the goal
+  "phases": [
+    {
+      "name": string,                     // e.g. "Modeling", "Simulation", "Tuning"
+      "goal": string,
+      "expected_roles": [string, ...],    // which kinds of experts will be needed
+      "deliverables": [string, ...]
+    }
+  ],
+  "risks": [string, ...],
+  "success_criteria": [string, ...],
+  "estimated_iterations": number
+}
+Be domain-aware: if the task involves electrical/mechanical/control systems,
+include those experts in expected_roles. No commentary outside the JSON."""
+
+
+MANAGER_SYSTEM = """You are the Manager of a recursive build system. A master
+plan already exists. Your job is to translate the next slice of that plan into
+concrete subtasks for one iteration.
+
+Output STRICT JSON:
 {
   "thought": string,
+  "phase": string,                          // which master-plan phase you're in
   "subtasks": [
     {"id": string, "description": string, "domain": string}
   ],
   "expected_artifacts": [string, ...]
 }
-Be specific. Subtasks should be small enough that one expert can finish in one
-turn. No commentary outside the JSON."""
+Subtasks must be small enough for one expert to finish in one turn. Reference
+the master plan's phases. No commentary outside the JSON."""
 
 
 HumanFn = Callable[[str, str], Awaitable[str]]
@@ -86,9 +114,11 @@ class Orchestrator:
             await self.sandbox.start()
             await self._loop()
         except Exception as e:
+            tb = traceback.format_exc()
             self.state.status = "error"
-            self.state.last_error = f"{type(e).__name__}: {e}"
-            self._emit("error", message=self.state.last_error)
+            self.state.last_error = f"{type(e).__name__}: {e}\n{tb}"
+            self._emit("error", message=f"{type(e).__name__}: {e}", traceback=tb)
+            print(tb, flush=True)
         finally:
             try:
                 await self.sandbox.stop()
@@ -99,90 +129,125 @@ class Orchestrator:
             self._emit("run_end", status=self.state.status)
 
     async def _loop(self) -> None:
-        critique = ""
-        manager_role = await self._forge_manager()
-        self.state.role_specs.append(manager_role.to_dict())
+        # Phase 1 — Plan mode: produce a master plan once before any execution.
+        if not self.state.master_plan:
+            self._emit("planning_start")
+            self.state.master_plan = await self._make_master_plan()
+            self.state.save()
+            self._emit("master_plan", plan=self.state.master_plan)
 
-        while True:
-            if self.flag.stop:
-                self.state.status = "stopped"
-                return
-            while self.flag.pause:
-                await asyncio.sleep(1)
-            if self.state.task.max_iters and len(self.state.iterations) >= self.state.task.max_iters:
-                self.state.status = "done"
-                self._emit("max_iters_reached")
-                return
+        # Phase 2 — Architect mode: god of the run.
+        # Build the Architect's tool registry: regular tools + the architect-only
+        # tools (spawn_subagent, request_judgment, record_iteration). Same
+        # workspace sandbox is shared with every spawned subagent.
+        arch_registry = build_default_registry(human_ask_fn=self.human_ask)
+        for t in make_architect_tools(
+            forge=self.forge,
+            backend=self.backend,
+            base_registry=self.tools,
+            sandbox=self.sandbox,
+            state=self.state,
+            judge=self.judge,
+            should_continue=self._should_continue,
+        ):
+            arch_registry.register(t)
+        self.architect_tools = arch_registry
 
-            n = len(self.state.iterations) + 1
-            self._emit("iteration_start", n=n)
+        architect_role = build_architect_role(self.state.master_plan)
+        if not any(r.get("title") == "Architect" for r in self.state.role_specs):
+            self.state.role_specs.append(architect_role.to_dict())
 
-            plan = await self._plan(critique)
-            self._emit("plan", n=n, plan=plan)
+        self._emit("architect_start")
+        architect = Agent(
+            role=architect_role,
+            backend=self.backend,
+            tools=arch_registry,
+            sandbox=self.sandbox,
+            max_steps=500,  # generous; the architect decides when to stop
+            should_continue=self._should_continue,
+            get_nudge=self._consume_nudge,
+        )
 
-            summaries: list[str] = []
-            for st in plan.get("subtasks", []) or []:
-                if self.flag.stop:
-                    break
-                role = await self.forge.forge(
-                    self.state.task.requirements,
-                    st.get("description", ""),
-                    self.state.task.domain_hints + [st.get("domain", "")],
-                )
-                self.state.role_specs.append(role.to_dict())
-                self._emit("role_forged", title=role.title)
+        user_prompt = (
+            f"USER TASK:\n{self.state.task.requirements}\n\n"
+            f"DOMAIN HINTS: {', '.join(self.state.task.domain_hints) or 'none'}\n\n"
+            "Deliver the perfect result. Spawn whatever experts you need, "
+            "iterate as many times as needed, and stop only when the Judge has "
+            "passed and you are confident the artifacts are excellent."
+        )
+        result = await architect.run(user_prompt)
+        self.state.tokens_in += result.tokens_in
+        self.state.tokens_out += result.tokens_out
+        self._emit(
+            "architect_end",
+            tool_calls=result.tool_calls,
+            tokens_in=result.tokens_in,
+            tokens_out=result.tokens_out,
+        )
 
-                agent = Agent(role, self.backend, self.tools, self.sandbox)
-                prompt = (
-                    f"TASK: {self.state.task.requirements}\n"
-                    f"SUBTASK: {st.get('description', '')}\n"
-                    f"Use tools to make real progress. End with <final>summary of what you did</final>."
-                )
-                ar = await agent.run(prompt)
-                self.state.tokens_in += ar.tokens_in
-                self.state.tokens_out += ar.tokens_out
-                summaries.append(f"[{role.title}] {ar.final_text}")
-                self._emit(
-                    "subtask_done",
-                    role=role.title,
-                    tool_calls=ar.tool_calls,
-                    tokens_in=ar.tokens_in,
-                    tokens_out=ar.tokens_out,
-                )
-
-            iteration_summary = "\n\n".join(summaries) or "(no work performed)"
+        # If the Architect emitted <final> without ever calling the Judge, run
+        # one final judgment so the user gets a real verdict.
+        recent_judged = any(
+            it.judge_passed for it in self.state.iterations[-3:]
+        )
+        if not recent_judged:
             verdict = await self.judge.evaluate(
                 self.state.task.requirements,
-                iteration_summary,
+                result.final_text or "(architect emitted no summary)",
                 self.state.task.done,
             )
-
-            it = Iteration(
-                n=n,
-                role="manager",
-                summary=iteration_summary,
-                judge_score=verdict.score,
-                judge_passed=verdict.passed,
-            )
-            self.state.iterations.append(it)
-            self.state.checkpoint(label=f"iter {n}")
-            self.state.save()
             self._emit(
                 "iteration_end",
-                n=n,
+                n=len(self.state.iterations) + 1,
                 score=verdict.score,
                 passed=verdict.passed,
                 rationale=verdict.rationale,
             )
+            self.state.iterations.append(
+                Iteration(
+                    n=len(self.state.iterations) + 1,
+                    role="architect",
+                    summary=result.final_text or "",
+                    judge_score=verdict.score,
+                    judge_passed=verdict.passed,
+                )
+            )
+            self.state.save()
 
-            if verdict.passed:
-                self.state.status = "done"
-                return
+        self.state.status = "stopped" if self.flag.stop else "done"
 
-            critique = verdict.rationale
-            if self.flag.nudge:
-                critique += f"\nUSER NUDGE: {self.flag.nudge}"
-                self.flag.nudge = ""
+    def _should_continue(self) -> bool:
+        if self.flag.stop:
+            return False
+        # Honor pause: block here so the agent waits between steps
+        while self.flag.pause and not self.flag.stop:
+            import time as _t
+            _t.sleep(0.5)
+        return not self.flag.stop
+
+    def _consume_nudge(self) -> str:
+        n = self.flag.nudge
+        self.flag.nudge = ""
+        return n
+
+    async def _make_master_plan(self) -> dict:
+        user = (
+            f"TASK: {self.state.task.requirements}\n"
+            f"DOMAIN HINTS: {', '.join(self.state.task.domain_hints) or 'none'}\n\n"
+            "Produce the master plan as JSON."
+        )
+        resp = await self.backend.complete(
+            system=PLANNER_SYSTEM, messages=[Message("user", user)]
+        )
+        self.state.tokens_in += resp.input_tokens
+        self.state.tokens_out += resp.output_tokens
+        return _extract_json(resp.text) or {
+            "summary": self.state.task.requirements,
+            "phases": [],
+            "risks": [],
+            "success_criteria": [],
+            "estimated_iterations": 0,
+        }
 
     async def _forge_manager(self) -> RoleSpec:
         return RoleSpec(
@@ -198,14 +263,19 @@ class Orchestrator:
             f"#{it.n} score={it.judge_score:.0f} passed={it.judge_passed}: {it.summary[:300]}"
             for it in self.state.iterations[-5:]
         )
+        mp = json.dumps(self.state.master_plan)[:2000] if self.state.master_plan else "(none)"
         user = (
             f"TASK: {self.state.task.requirements}\n"
             f"DOMAIN HINTS: {', '.join(self.state.task.domain_hints) or 'none'}\n"
+            f"MASTER PLAN:\n{mp}\n"
             f"HISTORY:\n{history or '(none)'}\n"
             f"LAST CRITIQUE:\n{critique or '(none)'}\n\n"
             "Produce the next iteration plan as JSON."
         )
+        self._emit("planning")
         resp = await self.backend.complete(
             system=MANAGER_SYSTEM, messages=[Message("user", user)]
         )
+        self.state.tokens_in += resp.input_tokens
+        self.state.tokens_out += resp.output_tokens
         return _extract_json(resp.text) or {"subtasks": []}
