@@ -76,12 +76,33 @@ class Judge:
         return Verdict(passed, score, rationale)
 
     async def _llm_judge(self, requirements: str, summary: str) -> Verdict:
-        # Include a workspace listing so the judge sees what was produced.
-        ls = await self.sandbox.run(["bash", "-lc", "ls -la"])
+        # Cheap static gate first: if any .py file in the workspace fails to
+        # parse, the iteration is broken regardless of what the LLM thinks.
+        # Same for syntactically-checkable JSON. This saves a judge call on
+        # obvious failures and gives the manager a precise rationale.
+        syntax_err = await self._syntax_gate()
+        if syntax_err:
+            return Verdict(False, 0.0, f"syntax: {syntax_err[:400]}")
+
+        # Build a richer workspace view: a tree (depth 3) + a small head of
+        # each tracked source file so the judge can actually evaluate quality.
+        tree = await self.sandbox.run(
+            ["bash", "-lc", "find . -maxdepth 3 -not -path '*/.*' | head -120"]
+        )
+        excerpts = await self.sandbox.run(
+            [
+                "bash",
+                "-lc",
+                "for f in $(find . -maxdepth 3 -type f \\( -name '*.py' -o -name '*.md' "
+                "-o -name '*.json' -o -name '*.txt' \\) -not -path '*/.*' | head -8); do "
+                "echo '--- '\"$f\"' ---'; head -40 \"$f\"; done",
+            ]
+        )
         user = (
             f"REQUIREMENTS:\n{requirements}\n\n"
             f"ITERATION SUMMARY:\n{summary}\n\n"
-            f"WORKSPACE:\n{ls.stdout}"
+            f"WORKSPACE TREE:\n{tree.stdout[:3000]}\n\n"
+            f"FILE EXCERPTS:\n{excerpts.stdout[:6000]}"
         )
         resp = await self.backend.complete(
             system=JUDGE_SYSTEM, messages=[Message("user", user)]
@@ -93,11 +114,43 @@ class Judge:
             rationale=str(data.get("rationale", resp.text[:200])),
         )
 
+    async def _syntax_gate(self) -> str:
+        """Compile every .py and parse every .json in the workspace. Returns an
+        error string on the first failure, or '' if everything parses."""
+        py = await self.sandbox.run(
+            [
+                "bash",
+                "-lc",
+                "set -e; for f in $(find . -name '*.py' -not -path '*/.*'); do "
+                "python -m py_compile \"$f\" || { echo \"PY_FAIL $f\"; exit 1; }; done",
+            ]
+        )
+        if py.exit_code != 0:
+            return (py.stderr or py.stdout)[:400]
+        js = await self.sandbox.run(
+            [
+                "bash",
+                "-lc",
+                "for f in $(find . -name '*.json' -not -path '*/.*'); do "
+                "python -c \"import json,sys;json.load(open('$f'))\" || "
+                "{ echo \"JSON_FAIL $f\"; exit 1; }; done",
+            ]
+        )
+        if js.exit_code != 0:
+            return (js.stderr or js.stdout)[:400]
+        return ""
+
     async def _tests(self, cmd: str) -> Verdict:
         r = await self.sandbox.run(["bash", "-lc", cmd])
         ok = r.exit_code == 0
+        # Surface the failing tail so the manager can actually fix it,
+        # instead of just seeing an exit code.
+        tail = ""
+        if not ok:
+            combined = (r.stdout or "") + "\n" + (r.stderr or "")
+            tail = " | " + combined.strip().splitlines()[-20:].__str__()[:600]
         return Verdict(
             passed=ok,
             score=100.0 if ok else 0.0,
-            rationale=f"tests exit={r.exit_code}",
+            rationale=f"tests exit={r.exit_code}{tail}",
         )

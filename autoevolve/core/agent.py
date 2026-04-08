@@ -67,6 +67,20 @@ class Agent:
         result = AgentResult(final_text="", transcript=messages)
 
         for _ in range(self.max_steps):
+            # Compact older tool_results so the prompt doesn't grow without bound.
+            # Keeps the original task + the last 10 turns intact; truncates the
+            # bulky middle to a one-line marker per message.
+            if len(messages) > 24:
+                head, tail = messages[:1], messages[-10:]
+                middle = messages[1:-10]
+                squashed = []
+                for m in middle:
+                    c = m.content
+                    if len(c) > 200:
+                        c = c[:160] + f"...[+{len(c)-160} chars compacted]"
+                    squashed.append(Message(m.role, c))
+                messages = head + squashed + tail
+                result.transcript = messages
             if self.should_continue and not self.should_continue():
                 result.final_text = "(stopped by orchestrator)"
                 return result

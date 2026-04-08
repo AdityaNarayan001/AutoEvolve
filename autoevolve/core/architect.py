@@ -12,6 +12,7 @@ Architect makes those calls itself."""
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING
 
 from ..llm.base import ToolSpec
@@ -49,6 +50,11 @@ YOUR TOOLS:
     - `spawn_subagent(role_description, task)` — forge a fresh domain expert
       on the fly and run them to completion. Returns their final output. Use
       this aggressively. Quality comes from the right mind on the right slice.
+    - `spawn_subagents_parallel(subagents=[{role_description, task}, ...])` —
+      run multiple independent experts at once. Strongly prefer this over
+      sequential spawns when subtasks don't depend on each other. Subagents
+      share the workspace and a NOTES.md scratchpad, so siblings see each
+      other's final outputs automatically.
     - `request_judgment(summary)` — strict Judge scores progress vs.
       requirements. Required before finishing.
     - `record_iteration(summary, score, passed)` — log a meaningful unit so
@@ -139,9 +145,28 @@ def make_architect_tools(
     arch_state.setdefault("last_judgment_passed", False)
     arch_state.setdefault("last_judgment_score", 0.0)
 
-    async def spawn(_sb: Sandbox, args: dict) -> str:
-        role_desc = args.get("role_description", "").strip()
-        sub_task = args.get("task", "").strip()
+    # Per-subagent token soft cap. The architect sees a warning in its
+    # tool result if a single subagent burns more than this; the manager
+    # can then steer subsequent spawns to be tighter.
+    SUBAGENT_TOKEN_SOFT_CAP = 60_000
+
+    NOTES_FILE = "NOTES.md"
+
+    async def _read_notes() -> str:
+        try:
+            return await sandbox.read_file(NOTES_FILE)
+        except Exception:
+            return ""
+
+    async def _append_note(role_title: str, summary: str) -> None:
+        cur = await _read_notes()
+        entry = f"\n## {role_title}\n{summary.strip()[:1200]}\n"
+        try:
+            await sandbox.write_file(NOTES_FILE, (cur or "# Shared notes\n") + entry)
+        except Exception:
+            pass
+
+    async def _run_one(role_desc: str, sub_task: str) -> str:
         if not role_desc or not sub_task:
             return "ERROR: spawn_subagent needs role_description and task"
 
@@ -153,6 +178,18 @@ def make_architect_tools(
         state.role_specs.append(spec.to_dict())
         state.append_event("role_forged", title=spec.title)
 
+        # Inject the shared notes so siblings benefit from earlier learnings.
+        notes = await _read_notes()
+        framed_task = sub_task
+        if notes.strip():
+            framed_task = (
+                f"SHARED NOTES FROM SIBLINGS (read before working):\n"
+                f"{notes[:2500]}\n\n"
+                f"YOUR TASK:\n{sub_task}\n\n"
+                f"When you finish, your <final> will be appended to NOTES.md "
+                f"so future siblings can build on it. Be concise and concrete."
+            )
+
         subagent = Agent(
             role=spec,
             backend=backend,
@@ -161,7 +198,7 @@ def make_architect_tools(
             max_steps=40,
             should_continue=should_continue,
         )
-        ar = await subagent.run(sub_task)
+        ar = await subagent.run(framed_task)
         state.tokens_in += ar.tokens_in
         state.tokens_out += ar.tokens_out
         arch_state["subagents_spawned"] = arch_state.get("subagents_spawned", 0) + 1
@@ -173,7 +210,42 @@ def make_architect_tools(
             tokens_out=ar.tokens_out,
         )
         state.save()
-        return f"[subagent: {spec.title}]\n{ar.final_text}"
+        await _append_note(spec.title, ar.final_text or "")
+
+        warn = ""
+        total = ar.tokens_in + ar.tokens_out
+        if total > SUBAGENT_TOKEN_SOFT_CAP:
+            warn = (
+                f"\n[WARN] this subagent used {total} tokens (cap "
+                f"{SUBAGENT_TOKEN_SOFT_CAP}). Tighten the next task scope."
+            )
+        return f"[subagent: {spec.title}]\n{ar.final_text}{warn}"
+
+    async def spawn(_sb: Sandbox, args: dict) -> str:
+        return await _run_one(
+            args.get("role_description", "").strip(),
+            args.get("task", "").strip(),
+        )
+
+    async def spawn_parallel(_sb: Sandbox, args: dict) -> str:
+        items = args.get("subagents") or []
+        if not isinstance(items, list) or not items:
+            return "ERROR: spawn_subagents_parallel needs a non-empty 'subagents' list"
+        coros = [
+            _run_one(
+                (it.get("role_description") or "").strip(),
+                (it.get("task") or "").strip(),
+            )
+            for it in items
+        ]
+        results = await asyncio.gather(*coros, return_exceptions=True)
+        out = []
+        for i, r in enumerate(results):
+            if isinstance(r, Exception):
+                out.append(f"--- subagent {i} FAILED: {type(r).__name__}: {r}")
+            else:
+                out.append(f"--- subagent {i} ---\n{r}")
+        return "\n\n".join(out)
 
     async def request_judgment(_sb: Sandbox, args: dict) -> str:
         summary = args.get("summary", "").strip()
@@ -248,6 +320,35 @@ def make_architect_tools(
                 },
             ),
             fn=spawn,
+        ),
+        Tool(
+            spec=ToolSpec(
+                name="spawn_subagents_parallel",
+                description=(
+                    "Spawn multiple expert subagents in parallel on independent "
+                    "subtasks. Use when phases don't depend on each other — "
+                    "much faster than sequential spawn_subagent calls. They share "
+                    "the workspace and the NOTES.md scratchpad."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "subagents": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "role_description": {"type": "string"},
+                                    "task": {"type": "string"},
+                                },
+                                "required": ["role_description", "task"],
+                            },
+                        }
+                    },
+                    "required": ["subagents"],
+                },
+            ),
+            fn=spawn_parallel,
         ),
         Tool(
             spec=ToolSpec(
