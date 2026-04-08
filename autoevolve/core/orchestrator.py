@@ -26,7 +26,7 @@ from ..llm.base import Backend, Message
 from ..sandbox import make_sandbox, Sandbox
 from ..tools import build_default_registry
 from .agent import Agent
-from .architect import build_architect_role, make_architect_tools
+from .architect import build_architect_role, make_architect_tools, make_architect_validator
 from .judge import Judge
 from .role_forge import RoleForge, RoleSpec, _extract_json
 from .state import Iteration, TaskState
@@ -141,6 +141,7 @@ class Orchestrator:
         # tools (spawn_subagent, request_judgment, record_iteration). Same
         # workspace sandbox is shared with every spawned subagent.
         arch_registry = build_default_registry(human_ask_fn=self.human_ask)
+        arch_state: dict = {}
         for t in make_architect_tools(
             forge=self.forge,
             backend=self.backend,
@@ -149,9 +150,11 @@ class Orchestrator:
             state=self.state,
             judge=self.judge,
             should_continue=self._should_continue,
+            arch_state=arch_state,
         ):
             arch_registry.register(t)
         self.architect_tools = arch_registry
+        validator = make_architect_validator(self.state, arch_state)
 
         architect_role = build_architect_role(self.state.master_plan)
         if not any(r.get("title") == "Architect" for r in self.state.role_specs):
@@ -166,6 +169,7 @@ class Orchestrator:
             max_steps=500,  # generous; the architect decides when to stop
             should_continue=self._should_continue,
             get_nudge=self._consume_nudge,
+            validate_final=validator,
         )
 
         user_prompt = (

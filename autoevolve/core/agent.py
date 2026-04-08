@@ -40,6 +40,7 @@ class Agent:
         max_steps: int = 30,
         should_continue: Callable[[], bool] | None = None,
         get_nudge: Callable[[], str] | None = None,
+        validate_final: Callable[["AgentResult"], str | None] | None = None,
     ):
         self.role = role
         self.backend = backend
@@ -48,6 +49,10 @@ class Agent:
         self.max_steps = max_steps
         self.should_continue = should_continue
         self.get_nudge = get_nudge
+        # validate_final: if provided, returns None to accept a <final>, or a
+        # string explaining why the final is rejected. The agent then sees the
+        # rejection as a user message and must keep working.
+        self.validate_final = validate_final
 
     async def run(self, user_prompt: str) -> AgentResult:
         sys_prompt = self.role.system_prompt + "\n\n" + TOOL_PROTOCOL
@@ -78,11 +83,38 @@ class Agent:
             final = _extract_tag(text, "final")
             if final is not None:
                 result.final_text = final
+                # Run validation. If the validator rejects, force the agent to
+                # keep working instead of letting it short-circuit.
+                if self.validate_final:
+                    reason = self.validate_final(result)
+                    if reason:
+                        messages.append(
+                            Message(
+                                "user",
+                                f"REJECTED: you cannot finish yet. {reason}\n"
+                                "Do the actual work using your tools, then try again.",
+                            )
+                        )
+                        result.final_text = ""
+                        continue
                 return result
 
             tool_call = _extract_tag(text, "tool")
             if not tool_call:
-                # No tool call and no final — treat as final.
+                # No tool call and no final tag. If a validator is set we
+                # require explicit progress, so push the agent to use tools.
+                if self.validate_final:
+                    messages.append(
+                        Message(
+                            "user",
+                            "You must either call a tool with <tool>{...}</tool> "
+                            "or finish with <final>...</final>. Free text alone "
+                            "does not count as progress. Pick the next concrete "
+                            "tool call.",
+                        )
+                    )
+                    continue
+                # Permissive mode for plain agents: treat free text as final.
                 result.final_text = text
                 return result
 
